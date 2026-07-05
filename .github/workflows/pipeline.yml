@@ -61,6 +61,18 @@ jobs:
           stage: "Docker Build"
           reason: "Check ./app/Dockerfile for syntax errors, missing dependencies, or broken COPY/RUN instructions."
 
+      - name: Save image for downstream jobs
+        if: steps.docker-build.outcome == 'success'
+        run: docker save vault-forge-app:${{ github.sha }} -o image.tar
+
+      - name: Upload image artifact
+        if: steps.docker-build.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image
+          path: image.tar
+          retention-days: 1
+
       - name: Install Syft
         if: steps.docker-build.outcome == 'success'
         run: curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
@@ -89,6 +101,51 @@ jobs:
       - name: Confirm pass
         if: steps.sbom.outcome == 'success'
         run: echo "✅ SBOM generated and uploaded successfully."
+
+  image-scan:
+    name: Trivy - Container Vulnerability Scan
+    needs: build-and-sbom
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Download image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image
+
+      - name: Load image
+        run: docker load -i image.tar
+
+      - name: Install Trivy
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+
+      - name: Run Trivy scan
+        id: trivy
+        continue-on-error: true
+        run: |
+          trivy image \
+            --severity CRITICAL,HIGH \
+            --format json \
+            --output trivy-report.json \
+            vault-forge-app:${{ github.sha }}
+
+      - name: Upload Trivy report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-report
+          path: trivy-report.json
+          retention-days: 30
+
+      - name: Report findings
+        if: always()
+        run: |
+          echo "::warning::🔍 Trivy scan complete - check trivy-report artifact for CRITICAL/HIGH CVEs."
+          echo "Base image is python:3.11.0b1-buster (EOL) - findings are expected and documented."
+          # Not blocking here - old base image is a known, accepted risk for this demo app.
+          # In a real production pipeline, CRITICAL findings would typically fail the build.
 
   sast-scan:
     name: Semgrep - SAST
@@ -122,8 +179,6 @@ jobs:
           echo "::warning::⚠️ Semgrep found security issues in the code."
           echo "This is expected for PyGoat (intentionally vulnerable app)."
           echo "Report uploaded as artifact 'semgrep-report' - review before deploying to any real environment."
-          # Not exiting 1 - PyGoat WILL have findings by design,
-          # we want visibility (report) not a hard block for this specific app
 
       - name: Confirm pass
         if: steps.semgrep.outcome == 'success'
