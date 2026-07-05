@@ -1,0 +1,9 @@
+# Falco runtime security - modern eBPF driver
+# Standard kernel-module driver failed to compile on WSL2's custom kernel
+# (6.18.33.1-microsoft-standard-WSL2). Modern eBPF driver works without
+# compilation and is the recommended approach for WSL2/kind environments.
+
+driver:
+  kind: modern_ebpf
+
+tty: true
