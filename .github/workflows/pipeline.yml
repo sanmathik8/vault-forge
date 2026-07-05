@@ -118,8 +118,7 @@ jobs:
         run: docker load -i image.tar
 
       - name: Install Trivy
-        run: |
-          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+        run: curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
 
       - name: Run Trivy scan
         id: trivy
@@ -144,8 +143,52 @@ jobs:
         run: |
           echo "::warning::🔍 Trivy scan complete - check trivy-report artifact for CRITICAL/HIGH CVEs."
           echo "Base image is python:3.11.0b1-buster (EOL) - findings are expected and documented."
-          # Not blocking here - old base image is a known, accepted risk for this demo app.
-          # In a real production pipeline, CRITICAL findings would typically fail the build.
+
+  dast-scan:
+    name: OWASP ZAP - DAST Scan
+    needs: build-and-sbom
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Download image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image
+
+      - name: Load image
+        run: docker load -i image.tar
+
+      - name: Run PyGoat container
+        run: |
+          docker run -d -p 8000:8000 --name pygoat-dast vault-forge-app:${{ github.sha }}
+          # give it real startup time - Django migrate + gunicorn boot is slow
+          sleep 30
+
+      - name: Confirm app is responding
+        run: |
+          curl -I http://localhost:8000 || (echo "::error::App not responding, aborting ZAP scan" && exit 1)
+
+      - name: Run ZAP baseline scan
+        id: zap
+        continue-on-error: true
+        uses: zaproxy/action-baseline@v0.12.0
+        with:
+          target: 'http://localhost:8000'
+          fail_action: false
+          # baseline = passive scan only, fast, safe for CI
+          # for real attack simulation (active scan), use action-full-scan instead,
+          # but that's slower and more aggressive - baseline is the right choice for CI
+
+      - name: Report ZAP findings
+        if: always()
+        run: |
+          echo "::warning::🔍 ZAP scan complete - check the zap_report artifact for details."
+          echo "PyGoat is intentionally vulnerable - findings (XSS, missing headers, etc.) are expected."
+
+      - name: Stop container
+        if: always()
+        run: docker stop pygoat-dast || true
 
   sast-scan:
     name: Semgrep - SAST
@@ -178,7 +221,6 @@ jobs:
         run: |
           echo "::warning::⚠️ Semgrep found security issues in the code."
           echo "This is expected for PyGoat (intentionally vulnerable app)."
-          echo "Report uploaded as artifact 'semgrep-report' - review before deploying to any real environment."
 
       - name: Confirm pass
         if: steps.semgrep.outcome == 'success'
