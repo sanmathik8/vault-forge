@@ -51,10 +51,18 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      actions: read
     outputs:
       sbom_result: ${{ steps.sbom.outcome }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Start Falco (CI supply-chain monitoring)
+        id: falco-start
+        continue-on-error: true
+        uses: falcosecurity/falco-actions/start@main
+        with:
+          mode: live
 
       - name: Build application image
         id: docker-build
@@ -98,6 +106,11 @@ jobs:
           path: sbom.json
           retention-days: 30
 
+      - name: Stop Falco and report
+        if: always()
+        continue-on-error: true
+        uses: falcosecurity/falco-actions/stop@main
+
   image-scan:
     name: Trivy - Container Vulnerability Scan
     needs: build-and-sbom
@@ -131,15 +144,38 @@ jobs:
           echo "critical=$CRIT" >> "$GITHUB_OUTPUT"
           echo "high=$HIGH" >> "$GITHUB_OUTPUT"
 
+      - name: Generate markdown CVE report
+        if: always()
+        run: |
+          echo "# Trivy CVE Report" > trivy-report.md
+          echo "" >> trivy-report.md
+          echo "**Image:** \`${{ env.IMAGE_NAME }}:${{ github.sha }}\`" >> trivy-report.md
+          echo "**Scan date:** $(date -u +"%Y-%m-%d %H:%M UTC")" >> trivy-report.md
+          echo "" >> trivy-report.md
+          echo "| Severity | CVE ID | Package | Installed | Fixed Version | Title |" >> trivy-report.md
+          echo "|---|---|---|---|---|---|" >> trivy-report.md
+          jq -r '
+            .Results[]?.Vulnerabilities[]? |
+            "| \(.Severity) | \(.VulnerabilityID) | \(.PkgName) | \(.InstalledVersion) | \(.FixedVersion // "N/A") | \(.Title // "N/A" | .[0:60]) |"
+          ' trivy-report.json >> trivy-report.md
+
+          CRIT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' trivy-report.json)
+          HIGH=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' trivy-report.json)
+          echo "" >> trivy-report.md
+          echo "**Total: $CRIT CRITICAL, $HIGH HIGH**" >> trivy-report.md
+
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: trivy-report
-          path: trivy-report.json
+          path: |
+            trivy-report.json
+            trivy-report.md
           retention-days: 30
 
       # BLOCKING GATE: fails the job if any CRITICAL CVE is found.
-      # Set ALLOW_CRITICAL_CVES=true as a repo variable to temporarily bypass
-      # while establishing a baseline (e.g. for a known-vulnerable demo target).
+      # Set repo variable ALLOW_CRITICAL_CVES=true to bypass while
+      # scanning a known-vulnerable demo target (e.g. PyGoat).
       - name: Gate on CRITICAL CVEs
         id: gate
         if: ${{ vars.ALLOW_CRITICAL_CVES != 'true' }}
@@ -188,15 +224,37 @@ jobs:
           echo "critical=$CRIT" >> "$GITHUB_OUTPUT"
           echo "Semgrep found $COUNT issues ($CRIT critical/ERROR severity)"
 
+      - name: Generate markdown findings report
+        if: always()
+        run: |
+          echo "# Semgrep SAST Report" > semgrep-report.md
+          echo "" >> semgrep-report.md
+          echo "**Target:** \`${{ env.APP_PATH }}\`" >> semgrep-report.md
+          echo "**Scan date:** $(date -u +"%Y-%m-%d %H:%M UTC")" >> semgrep-report.md
+          echo "" >> semgrep-report.md
+          echo "| Severity | Rule ID | File | Line | Message |" >> semgrep-report.md
+          echo "|---|---|---|---|---|" >> semgrep-report.md
+          jq -r '
+            .results[]? |
+            "| \(.extra.severity) | \(.check_id) | \(.path) | \(.start.line) | \(.extra.message // "N/A" | gsub("\n";" ") | .[0:70]) |"
+          ' semgrep.json >> semgrep-report.md
+
+          COUNT=$(jq '.results | length' semgrep.json)
+          CRIT=$(jq '[.results[]? | select(.extra.severity=="ERROR")] | length' semgrep.json)
+          echo "" >> semgrep-report.md
+          echo "**Total: $COUNT findings ($CRIT critical/ERROR)**" >> semgrep-report.md
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: semgrep-report
-          path: semgrep.json
+          path: |
+            semgrep.json
+            semgrep-report.md
           retention-days: 30
 
-      # BLOCKING GATE: fails on ERROR-severity (critical-equivalent) Semgrep findings.
-      # Set ALLOW_CRITICAL_CVES=true as a repo variable to bypass for known-vulnerable demo targets.
+      # BLOCKING GATE: fails on ERROR-severity (critical-equivalent) findings.
+      # Set repo variable ALLOW_CRITICAL_CVES=true to bypass for demo targets.
       - name: Gate on critical findings
         id: gate
         if: ${{ vars.ALLOW_CRITICAL_CVES != 'true' }}
@@ -263,6 +321,8 @@ jobs:
               `- Critical container CVEs (Trivy): ${crit_cve}`,
               `- Critical SAST findings (Semgrep): ${crit_sast}`,
               ``,
+              `Full markdown reports are attached as workflow artifacts (trivy-report, semgrep-report).`,
+              ``,
               `Commit: ${context.sha}`,
               `Run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`
             ].join("\n");
@@ -302,8 +362,9 @@ jobs:
           echo "|---|---|" >> $GITHUB_STEP_SUMMARY
           echo "| Secrets (Gitleaks) | ${{ needs.secrets-scan.outputs.result == 'success' && 'PASS' || 'FAIL' }} |" >> $GITHUB_STEP_SUMMARY
           echo "| SBOM (Syft) | ${{ needs.build-and-sbom.outputs.sbom_result == 'success' && 'PASS' || 'FAIL' }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Container CVEs (Trivy) | $CRIT critical, $HIGH high |" >> $GITHUB_STEP_SUMMARY
-          echo "| SAST (Semgrep) | $SEMGREP_FINDINGS findings ($SEMGREP_CRIT critical) |" >> $GITHUB_STEP_SUMMARY
+          echo "| Container CVEs (Trivy) | $CRIT critical, $HIGH high — see trivy-report artifact |" >> $GITHUB_STEP_SUMMARY
+          echo "| SAST (Semgrep) | $SEMGREP_FINDINGS findings ($SEMGREP_CRIT critical) — see semgrep-report artifact |" >> $GITHUB_STEP_SUMMARY
           echo "| DAST (ZAP active scan) | ${{ needs.dast-scan.outputs.result == 'success' && 'Clean' || 'Findings reported' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| CI Runtime (Falco) | See build-and-sbom job summary |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Security Score: ${SCORE}/100**" >> $GITHUB_STEP_SUMMARY
