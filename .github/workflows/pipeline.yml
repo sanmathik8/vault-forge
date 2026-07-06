@@ -154,8 +154,7 @@ jobs:
             --config=p/owasp-top-ten \
             --config=p/django \
             --config=p/python \
-            --sarif --output=semgrep.sarif \
-            --json --json-output=semgrep.json \
+            --json --output=semgrep.json \
             ./app
 
       - name: Count findings
@@ -170,9 +169,7 @@ jobs:
         if: always()
         with:
           name: semgrep-report
-          path: |
-            semgrep.sarif
-            semgrep.json
+          path: semgrep.json
           retention-days: 30
 
   dast-scan:
