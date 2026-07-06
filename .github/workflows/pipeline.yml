@@ -12,6 +12,11 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  APP_PATH: ./app          # change this to point at any target application
+  IMAGE_NAME: vault-forge-app
+  APP_PORT: 8000
+
 jobs:
   secrets-scan:
     name: Gitleaks - Secrets Scan
@@ -54,17 +59,17 @@ jobs:
       - name: Build application image
         id: docker-build
         continue-on-error: true
-        run: docker build -t vault-forge-app:${{ github.sha }} ./app
+        run: docker build -t ${{ env.IMAGE_NAME }}:${{ github.sha }} ${{ env.APP_PATH }}
 
       - name: Handle build failure
         if: steps.docker-build.outcome == 'failure'
         uses: ./.github/actions/graceful-exit
         with:
           stage: "Docker Build"
-          reason: "Check ./app/Dockerfile for syntax errors, missing dependencies, or broken COPY/RUN instructions."
+          reason: "Check ${{ env.APP_PATH }}/Dockerfile for syntax errors, missing dependencies, or broken COPY/RUN instructions."
 
       - name: Save image for downstream jobs
-        run: docker save vault-forge-app:${{ github.sha }} -o image.tar
+        run: docker save ${{ env.IMAGE_NAME }}:${{ github.sha }} -o image.tar
 
       - uses: actions/upload-artifact@v4
         with:
@@ -78,7 +83,7 @@ jobs:
       - name: Generate SBOM
         id: sbom
         continue-on-error: true
-        run: syft vault-forge-app:${{ github.sha }} -o cyclonedx-json=sbom.json
+        run: syft ${{ env.IMAGE_NAME }}:${{ github.sha }} -o cyclonedx-json=sbom.json
 
       - name: Handle SBOM failure
         if: steps.sbom.outcome == 'failure'
@@ -102,6 +107,7 @@ jobs:
     outputs:
       critical_count: ${{ steps.count.outputs.critical }}
       high_count: ${{ steps.count.outputs.high }}
+      result: ${{ steps.gate.outcome }}
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -115,7 +121,7 @@ jobs:
       - name: Run Trivy scan
         continue-on-error: true
         run: |
-          trivy image --severity CRITICAL,HIGH --format json --output trivy-report.json vault-forge-app:${{ github.sha }}
+          trivy image --severity CRITICAL,HIGH --format json --output trivy-report.json ${{ env.IMAGE_NAME }}:${{ github.sha }}
 
       - name: Count findings
         id: count
@@ -131,6 +137,20 @@ jobs:
           path: trivy-report.json
           retention-days: 30
 
+      # BLOCKING GATE: fails the job if any CRITICAL CVE is found.
+      # Set ALLOW_CRITICAL_CVES=true as a repo variable to temporarily bypass
+      # while establishing a baseline (e.g. for a known-vulnerable demo target).
+      - name: Gate on CRITICAL CVEs
+        id: gate
+        if: ${{ vars.ALLOW_CRITICAL_CVES != 'true' }}
+        run: |
+          CRIT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' trivy-report.json)
+          echo "Critical CVEs found: $CRIT"
+          if [ "$CRIT" -gt 0 ]; then
+            echo "::error::$CRIT CRITICAL CVE(s) found in container image. Failing build."
+            exit 1
+          fi
+
   sast-scan:
     name: Semgrep - SAST
     needs: secrets-scan
@@ -138,8 +158,9 @@ jobs:
     permissions:
       contents: read
     outputs:
-      result: ${{ steps.semgrep.outcome }}
+      result: ${{ steps.gate.outcome }}
       finding_count: ${{ steps.count.outputs.findings }}
+      critical_count: ${{ steps.count.outputs.critical }}
     steps:
       - uses: actions/checkout@v4
 
@@ -155,15 +176,17 @@ jobs:
             --config=p/django \
             --config=p/python \
             --json --output=semgrep.json \
-            ./app
+            ${{ env.APP_PATH }}
 
       - name: Count findings
         id: count
         if: always()
         run: |
           COUNT=$(jq '.results | length' semgrep.json 2>/dev/null || echo 0)
+          CRIT=$(jq '[.results[]? | select(.extra.severity=="ERROR")] | length' semgrep.json 2>/dev/null || echo 0)
           echo "findings=$COUNT" >> "$GITHUB_OUTPUT"
-          echo "Semgrep found $COUNT issues"
+          echo "critical=$CRIT" >> "$GITHUB_OUTPUT"
+          echo "Semgrep found $COUNT issues ($CRIT critical/ERROR severity)"
 
       - uses: actions/upload-artifact@v4
         if: always()
@@ -172,8 +195,20 @@ jobs:
           path: semgrep.json
           retention-days: 30
 
+      # BLOCKING GATE: fails on ERROR-severity (critical-equivalent) Semgrep findings.
+      # Set ALLOW_CRITICAL_CVES=true as a repo variable to bypass for known-vulnerable demo targets.
+      - name: Gate on critical findings
+        id: gate
+        if: ${{ vars.ALLOW_CRITICAL_CVES != 'true' }}
+        run: |
+          CRIT=${{ steps.count.outputs.critical }}
+          if [ "$CRIT" -gt 0 ]; then
+            echo "::error::$CRIT critical-severity Semgrep finding(s). Failing build."
+            exit 1
+          fi
+
   dast-scan:
-    name: OWASP ZAP - DAST Scan
+    name: OWASP ZAP - DAST Scan (Active)
     needs: build-and-sbom
     runs-on: ubuntu-latest
     permissions:
@@ -189,23 +224,56 @@ jobs:
 
       - name: Run target application
         run: |
-          docker run -d -p 8000:8000 --name target-app vault-forge-app:${{ github.sha }}
+          docker run -d -p ${{ env.APP_PORT }}:${{ env.APP_PORT }} --name target-app ${{ env.IMAGE_NAME }}:${{ github.sha }}
           sleep 30
 
       - name: Confirm app is responding
-        run: curl -I http://localhost:8000 || (echo "::error::App not responding, aborting ZAP scan" && exit 1)
+        run: curl -I http://localhost:${{ env.APP_PORT }} || (echo "::error::App not responding, aborting ZAP scan" && exit 1)
 
-      - name: Run ZAP baseline scan
+      - name: Run ZAP full active scan
         id: zap
         continue-on-error: true
-        uses: zaproxy/action-baseline@v0.12.0
+        uses: zaproxy/action-full-scan@v0.10.0
         with:
-          target: 'http://localhost:8000'
+          target: 'http://localhost:${{ env.APP_PORT }}'
           fail_action: false
 
       - name: Stop application
         if: always()
         run: docker stop target-app || true
+
+  create-issue-on-critical:
+    name: Create GitHub Issue for Critical Findings
+    needs: [image-scan, sast-scan]
+    if: always() && (needs.image-scan.result == 'failure' || needs.sast-scan.result == 'failure')
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Create issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const crit_cve = "${{ needs.image-scan.outputs.critical_count || 0 }}";
+            const crit_sast = "${{ needs.sast-scan.outputs.critical_count || 0 }}";
+            const title = `Critical security findings on ${context.sha.substring(0,7)}`;
+            const body = [
+              `**Automated finding from VaultForge Security Pipeline**`,
+              ``,
+              `- Critical container CVEs (Trivy): ${crit_cve}`,
+              `- Critical SAST findings (Semgrep): ${crit_sast}`,
+              ``,
+              `Commit: ${context.sha}`,
+              `Run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`
+            ].join("\n");
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: title,
+              body: body,
+              labels: ["security", "critical", "automated"]
+            });
 
   security-summary:
     name: Security Summary
@@ -218,6 +286,7 @@ jobs:
           CRIT=${{ needs.image-scan.outputs.critical_count || 0 }}
           HIGH=${{ needs.image-scan.outputs.high_count || 0 }}
           SEMGREP_FINDINGS=${{ needs.sast-scan.outputs.finding_count || 0 }}
+          SEMGREP_CRIT=${{ needs.sast-scan.outputs.critical_count || 0 }}
 
           SCORE=100
           [ "${{ needs.secrets-scan.outputs.result }}" != "success" ] && SCORE=$((SCORE-100))
@@ -227,16 +296,14 @@ jobs:
           [ "${{ needs.dast-scan.outputs.result }}" != "success" ] && SCORE=$((SCORE-10))
           [ $SCORE -lt 0 ] && SCORE=0
 
-          echo "## 🛡️ VaultForge Security Summary" >> $GITHUB_STEP_SUMMARY
+          echo "## VaultForge Security Summary" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Stage | Result |" >> $GITHUB_STEP_SUMMARY
           echo "|---|---|" >> $GITHUB_STEP_SUMMARY
-          echo "| Secrets (Gitleaks) | ${{ needs.secrets-scan.outputs.result == 'success' && '✅ PASS' || '❌ FAIL' }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| SBOM (Syft) | ${{ needs.build-and-sbom.outputs.sbom_result == 'success' && '✅ PASS' || '❌ FAIL' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Secrets (Gitleaks) | ${{ needs.secrets-scan.outputs.result == 'success' && 'PASS' || 'FAIL' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| SBOM (Syft) | ${{ needs.build-and-sbom.outputs.sbom_result == 'success' && 'PASS' || 'FAIL' }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Container CVEs (Trivy) | $CRIT critical, $HIGH high |" >> $GITHUB_STEP_SUMMARY
-          echo "| SAST (Semgrep) | $SEMGREP_FINDINGS findings |" >> $GITHUB_STEP_SUMMARY
-          echo "| DAST (ZAP) | ${{ needs.dast-scan.outputs.result == 'success' && '✅ Clean' || '⚠️ Findings reported' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| SAST (Semgrep) | $SEMGREP_FINDINGS findings ($SEMGREP_CRIT critical) |" >> $GITHUB_STEP_SUMMARY
+          echo "| DAST (ZAP active scan) | ${{ needs.dast-scan.outputs.result == 'success' && 'Clean' || 'Findings reported' }} |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Security Score: ${SCORE}/100**" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "_Findings are expected for this demo application and are documented in the README, not treated as pipeline defects._" >> $GITHUB_STEP_SUMMARY
