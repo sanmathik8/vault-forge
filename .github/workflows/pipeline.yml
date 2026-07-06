@@ -147,7 +147,11 @@ jobs:
         continue-on-error: true
         uses: semgrep/semgrep-action@v1
         with:
-          config: auto
+          config: >-
+            p/owasp-top-ten
+            p/django
+            p/python
+            p/security-audit
           generateSarif: "1"
 
       - uses: actions/upload-artifact@v4
@@ -202,7 +206,6 @@ jobs:
           CRIT=${{ needs.image-scan.outputs.critical_count || 0 }}
           HIGH=${{ needs.image-scan.outputs.high_count || 0 }}
 
-          # Simple scoring: start at 100, deduct per finding category
           SCORE=100
           [ "${{ needs.secrets-scan.outputs.result }}" != "success" ] && SCORE=$((SCORE-100))
           [ "$CRIT" -gt 0 ] && SCORE=$((SCORE - CRIT*10))
