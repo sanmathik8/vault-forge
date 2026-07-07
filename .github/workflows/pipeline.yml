@@ -152,17 +152,44 @@ jobs:
           echo "**Image:** \`${{ env.IMAGE_NAME }}:${{ github.sha }}\`" >> trivy-report.md
           echo "**Scan date:** $(date -u +"%Y-%m-%d %H:%M UTC")" >> trivy-report.md
           echo "" >> trivy-report.md
-          echo "| Severity | CVE ID | Package | Installed | Fixed Version | Title |" >> trivy-report.md
-          echo "|---|---|---|---|---|---|" >> trivy-report.md
-          jq -r '
-            .Results[]?.Vulnerabilities[]? |
-            "| \(.Severity) | \(.VulnerabilityID) | \(.PkgName) | \(.InstalledVersion) | \(.FixedVersion // "N/A") | \(.Title // "N/A" | .[0:60]) |"
-          ' trivy-report.json >> trivy-report.md
 
           CRIT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' trivy-report.json)
           HIGH=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' trivy-report.json)
+
+          echo "## Summary" >> trivy-report.md
           echo "" >> trivy-report.md
-          echo "**Total: $CRIT CRITICAL, $HIGH HIGH**" >> trivy-report.md
+          echo "| Severity | Count |" >> trivy-report.md
+          echo "|---|---|" >> trivy-report.md
+          echo "| CRITICAL | $CRIT |" >> trivy-report.md
+          echo "| HIGH | $HIGH |" >> trivy-report.md
+          echo "" >> trivy-report.md
+
+          echo "## Critical findings (full detail)" >> trivy-report.md
+          echo "" >> trivy-report.md
+          echo "| CVE ID | Package | Installed | Fixed Version | Title |" >> trivy-report.md
+          echo "|---|---|---|---|---|" >> trivy-report.md
+          jq -r '
+            .Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL") |
+            "| \(.VulnerabilityID) | \(.PkgName) | \(.InstalledVersion) | \(.FixedVersion // "N/A") | \(.Title // "N/A" | .[0:70]) |"
+          ' trivy-report.json | sort -u >> trivy-report.md
+          echo "" >> trivy-report.md
+
+          echo "<details>" >> trivy-report.md
+          echo "<summary><strong>High-severity findings ($HIGH) — click to expand, grouped by package</strong></summary>" >> trivy-report.md
+          echo "" >> trivy-report.md
+          jq -r '
+            .Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH") | .PkgName
+          ' trivy-report.json | sort -u | while read -r pkg; do
+            echo "" >> trivy-report.md
+            echo "**$pkg**" >> trivy-report.md
+            echo "" >> trivy-report.md
+            jq -r --arg pkg "$pkg" '
+              .Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH" and .PkgName==$pkg) |
+              "- \(.VulnerabilityID): \(.Title // "N/A" | .[0:70]) (fixed in \(.FixedVersion // "N/A"))"
+            ' trivy-report.json >> trivy-report.md
+          done
+          echo "" >> trivy-report.md
+          echo "</details>" >> trivy-report.md
 
       - uses: actions/upload-artifact@v4
         if: always()
@@ -232,17 +259,44 @@ jobs:
           echo "**Target:** \`${{ env.APP_PATH }}\`" >> semgrep-report.md
           echo "**Scan date:** $(date -u +"%Y-%m-%d %H:%M UTC")" >> semgrep-report.md
           echo "" >> semgrep-report.md
-          echo "| Severity | Rule ID | File | Line | Message |" >> semgrep-report.md
-          echo "|---|---|---|---|---|" >> semgrep-report.md
-          jq -r '
-            .results[]? |
-            "| \(.extra.severity) | \(.check_id) | \(.path) | \(.start.line) | \(.extra.message // "N/A" | gsub("\n";" ") | .[0:70]) |"
-          ' semgrep.json >> semgrep-report.md
 
           COUNT=$(jq '.results | length' semgrep.json)
           CRIT=$(jq '[.results[]? | select(.extra.severity=="ERROR")] | length' semgrep.json)
+          WARN=$(jq '[.results[]? | select(.extra.severity=="WARNING")] | length' semgrep.json)
+
+          echo "## Summary" >> semgrep-report.md
           echo "" >> semgrep-report.md
-          echo "**Total: $COUNT findings ($CRIT critical/ERROR)**" >> semgrep-report.md
+          echo "| Severity | Count |" >> semgrep-report.md
+          echo "|---|---|" >> semgrep-report.md
+          echo "| ERROR (critical) | $CRIT |" >> semgrep-report.md
+          echo "| WARNING | $WARN |" >> semgrep-report.md
+          echo "| **Total** | **$COUNT** |" >> semgrep-report.md
+          echo "" >> semgrep-report.md
+
+          echo "## Critical (ERROR) findings — full detail" >> semgrep-report.md
+          echo "" >> semgrep-report.md
+          echo "| Rule | File | Line | Message |" >> semgrep-report.md
+          echo "|---|---|---|---|" >> semgrep-report.md
+          jq -r '
+            .results[]? | select(.extra.severity=="ERROR") |
+            "| \(.check_id) | \(.path) | \(.start.line) | \(.extra.message // "N/A" | gsub("\n";" ") | .[0:80]) |"
+          ' semgrep.json >> semgrep-report.md
+          echo "" >> semgrep-report.md
+
+          echo "<details>" >> semgrep-report.md
+          echo "<summary><strong>Warning-level findings ($WARN) — click to expand, grouped by rule</strong></summary>" >> semgrep-report.md
+          echo "" >> semgrep-report.md
+          jq -r '.results[]? | select(.extra.severity=="WARNING") | .check_id' semgrep.json | sort -u | while read -r rule; do
+            echo "" >> semgrep-report.md
+            echo "**$rule**" >> semgrep-report.md
+            echo "" >> semgrep-report.md
+            jq -r --arg rule "$rule" '
+              .results[]? | select(.extra.severity=="WARNING" and .check_id==$rule) |
+              "- \(.path):\(.start.line)"
+            ' semgrep.json >> semgrep-report.md
+          done
+          echo "" >> semgrep-report.md
+          echo "</details>" >> semgrep-report.md
 
       - uses: actions/upload-artifact@v4
         if: always()
@@ -321,7 +375,7 @@ jobs:
               `- Critical container CVEs (Trivy): ${crit_cve}`,
               `- Critical SAST findings (Semgrep): ${crit_sast}`,
               ``,
-              `Full markdown reports are attached as workflow artifacts (trivy-report, semgrep-report).`,
+              `Full markdown reports (with critical findings in full detail and high/warning findings grouped and collapsible) are attached as workflow artifacts: trivy-report, semgrep-report.`,
               ``,
               `Commit: ${context.sha}`,
               `Run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`
