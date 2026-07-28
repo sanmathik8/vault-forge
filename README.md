@@ -214,20 +214,6 @@ At the end of every workflow, SecureFlow generates:
 
 ---
 
-# 🚀 Running the Pipeline
-
-```bash
-git clone https://github.com/<your-username>/SecureFlow.git
-
-cd SecureFlow
-
-git push origin main
-```
-
-GitHub Actions automatically executes the complete security pipeline.
-
----
-
 # 💡 Use Cases
 
 * Secure CI/CD Pipelines
