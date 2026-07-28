@@ -44,11 +44,11 @@ Generate SBOM (Syft)
       ▼
 Container Scan (Trivy)
       │
-      ├──────────────┐
-      ▼              │
-SAST (Semgrep)       │
-      │              │
-      ▼              │
+      |
+      ▼              
+SAST (Semgrep)       
+      │              
+      ▼              
 Run Application
       │
       ▼
@@ -241,18 +241,5 @@ GitHub Actions automatically executes the complete security pipeline.
 
 ---
 
-# 🎯 Future Enhancements
-
-* Kubernetes Security Scanning
-* IaC Security (Checkov/Terrascan)
-* Dependency Scanning
-* Slack / Microsoft Teams Notifications
-* SARIF Upload
-* Multi-Container Support
-* ECR / Docker Hub Publishing
-* Policy-as-Code Integration
-* Security Dashboard
-
----
 
 
